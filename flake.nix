@@ -17,7 +17,12 @@
       flake-utils,
       fenix,
     }:
-    flake-utils.lib.eachDefaultSystem (
+   {
+     nixosModules.fips = ./module.nix;
+     overlays.default = final: prev: {
+       fips = self.packages.${final.system}.fips;
+     };
+    } // flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
