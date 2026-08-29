@@ -67,7 +67,8 @@
           # Ship the default config, hosts file, and nftables baseline so
           # the NixOS module can reference them via $out/share/fips/ without
           # needing the source tree. DNS routing is handled declaratively
-          # via services.resolved on NixOS (no setup/teardown scripts needed).
+          # via a systemd-resolved drop-in on NixOS (no setup/teardown
+          # scripts needed).
           postInstall = ''
             install -Dm 0644 ${./packaging/common/fips.yaml} $out/share/fips/fips.yaml
             install -Dm 0644 ${./packaging/common/hosts}     $out/share/fips/hosts

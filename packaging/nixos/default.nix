@@ -79,8 +79,13 @@ in
         default = true;
         description = ''
           Route .fips queries to the fips DNS responder on [::1]:5354
-          via systemd-resolved. Without this, .fips hostnames don't
-          resolve on the host.
+          via a systemd-resolved drop-in. Presupposes the host is
+          running systemd-resolved; the module does not force it on so
+          an operator's own resolver choice (dnsmasq, NetworkManager)
+          is left undisturbed. Without this, .fips hostnames don't
+          resolve on the host. Disabling removes the drop-in on the
+          next rebuild, but systemd-resolved keeps the old routing in
+          memory until it is restarted.
         '';
       };
     };
@@ -104,6 +109,11 @@ in
     # matching the Debian/AUR posture.
     users.groups.fips = { };
 
+    # .fips resolution presupposes systemd-resolved; surface a missing
+    # resolver at eval time instead of only a failed fips-dns unit at boot.
+    warnings = lib.optionals (cfg.dns.enable && !config.services.resolved.enable) [
+      "services.fips.dns.enable is true but services.resolved.enable is false — .fips names will not resolve. Enable systemd-resolved, or forward the .fips zone to [::1]:5354 in your own resolver and ignore this warning."
+    ];
     # Root-owned writable directories for hosts file, ACL files, and
     # nftables drop-ins. fips hardcodes /etc/fips/hosts,
     # /etc/fips/peers.allow, /etc/fips/peers.deny on Linux, so these MUST
@@ -183,11 +193,43 @@ in
       };
     };
 
-    services.resolved = lib.mkIf cfg.dns.enable {
-      enable = true;
-      settings.Resolve = {
-        DNS = [ "[::1]:5354" ];
-        Domains = [ "~fips" ];
+    # Declarative resolved drop-in for the .fips zone. Writes
+    # /etc/systemd/resolved.conf.d/fips.conf so systemd-resolved forwards
+    # .fips queries to the daemon's DNS responder on [::1]:5354. This is
+    # the NixOS-native equivalent of the upstream fips-dns-setup script's
+    # "global drop-in" backend — it avoids per-link interface scoping and
+    # the IPV6_PKTINFO ifindex attribution that can cause queries to be
+    # silently dropped by the mesh-interface filter. Upstream's setup
+    # script now prefers its dns-delegate backend on systemd >= 258; the
+    # drop-in is kept here deliberately because it is uniform across
+    # NixOS releases, declarative via environment.etc, and purely
+    # additive — it never clobbers the operator's resolved config.
+    environment.etc."systemd/resolved.conf.d/fips.conf" = lib.mkIf cfg.dns.enable {
+      text = ''
+        # Managed by services.fips.dns.enable — do not edit.
+        [Resolve]
+        DNS=[::1]:5354
+        Domains=~fips
+      '';
+    };
+
+    # Restart resolved once after the daemon is up so the drop-in takes
+    # effect. Fails loudly on hosts without systemd-resolved so the
+    # operator notices the missing dependency rather than debugging
+    # silent .fips resolution failure. Deliberately no
+    # PartOf=fips.service (unlike the rest of the wiring): the drop-in
+    # needs no re-application, and matching upstream fips-dns.service
+    # here keeps a fips restart from bouncing the host resolver.
+    systemd.services.fips-dns = lib.mkIf cfg.dns.enable {
+      description = "Apply .fips DNS forwarding to systemd-resolved";
+      after = [ "fips.service" ];
+      requires = [ "fips.service" ];
+      wantedBy = [ "fips.service" ];
+      unitConfig.ConditionPathExists = "/etc/systemd/resolved.conf.d/fips.conf";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.systemd}/bin/systemctl restart systemd-resolved.service";
       };
     };
 
