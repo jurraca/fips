@@ -73,6 +73,41 @@ in
       '';
     };
 
+    firewall = {
+      enable = lib.mkEnableOption "the fips0 mesh-interface nftables baseline" // {
+        description = ''
+          Install and load the shipped fips.nft baseline
+          (packaging/common/fips.nft) as a fips-firewall.service oneshot.
+          The baseline polices only the fips0 mesh interface, leaving
+          Docker, Tor, and the host firewall untouched; inbound on the
+          mesh interface is denied except for established replies,
+          ICMPv6 echo-request, and the operator drop-ins from
+          services.fips.firewall.extraRules. Outbound is unrestricted.
+          Note that accepts in extraRules do not bypass the NixOS host
+          firewall (networking.firewall, enabled by default) — a packet
+          must pass both. Open the port in both places, or set
+          networking.firewall.trustedInterfaces = [ "fips0" ] and let
+          this baseline be the sole policy for the mesh interface.
+        '';
+      };
+
+      extraRules = lib.mkOption {
+        type = lib.types.lines;
+        default = "";
+        description = ''
+          nftables rule lines written to /etc/fips/fips.d/extra.nft and
+          included inline into the baseline inbound chain — e.g.
+          `tcp dport 22 accept` to permit SSH over the mesh. Reload with
+          `systemctl reload fips-firewall` (gapless: the table is
+          replaced in a single nft transaction).
+        '';
+        example = ''
+          tcp dport 22 accept
+          tcp dport 80 accept
+        '';
+      };
+    };
+
     dns = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -264,6 +299,33 @@ in
         PrivateTmp = true;
         ProtectKernelModules = true;
         ProtectKernelTunables = false;
+      };
+    };
+
+    # Operator nftables drop-in for the mesh-interface baseline. The
+    # /etc/fips/fips.d/ directory is created by the tmpfiles rules above;
+    # fips.nft includes /etc/fips/fips.d/*.nft inline in its inbound chain.
+    environment.etc."fips/fips.d/extra.nft" = lib.mkIf cfg.firewall.enable {
+      text = cfg.firewall.extraRules;
+    };
+
+    systemd.services.fips-firewall = lib.mkIf cfg.firewall.enable {
+      description = "FIPS mesh-interface nftables baseline";
+      documentation = [ "file://${cfg.package}/share/fips/fips.nft" ];
+      before = [ "fips.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.nftables}/bin/nft -f ${cfg.package}/share/fips/fips.nft";
+        # Reapplies the ruleset in place: fips.nft adds then flushes the
+        # table, so one nft run replaces it in a single transaction, with
+        # no moment without it. A restart, by contrast, runs ExecStop
+        # (delete table) before ExecStart, leaving a gap.
+        ExecReload = "${pkgs.nftables}/bin/nft -f ${cfg.package}/share/fips/fips.nft";
+        ExecStop = "-${pkgs.nftables}/bin/nft delete table inet fips";
+        StandardOutput = "journal";
+        StandardError = "journal";
       };
     };
 
