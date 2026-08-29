@@ -13,19 +13,21 @@
 #
 # --- Hybrid config pattern ---
 #
-# fips.yaml and identity keys live in /var/lib/fips/ (writable, survives
-# reboots and rebuilds). The shipped default is seeded there on first run
-# only; operator edits are never clobbered.
+# fips.yaml and identity keys live in /etc/fips/ (writable, survives
+# reboots and rebuilds), matching the Debian/AUR packaging layout. The
+# shipped default is seeded there on first run only; operator edits are
+# never clobbered. The daemon derives key paths (fips.key/fips.pub) from
+# the config file's parent directory, so keys land alongside the config.
 #
-# The hosts file and ACL files (peers.allow, peers.deny) MUST stay at
+# The hosts file and ACL files (peers.allow, peers.deny) also live at
 # /etc/fips/ because fips hardcodes those paths on Linux
 # (DEFAULT_HOSTS_PATH, DEFAULT_PEERS_ALLOW_PATH, DEFAULT_PEERS_DENY_PATH).
 # They are seeded as real writable files (not Nix store symlinks) so the
 # operator can edit them directly.
 #
-# fips is launched with --config /var/lib/fips/fips.yaml, which bypasses
+# fips is launched with --config /etc/fips/fips.yaml, which bypasses
 # the config search path entirely — fips will never accidentally load
-# /etc/fips/fips.yaml instead of the user-managed version.
+# a stale or alternate config.
 {
   config,
   lib,
@@ -35,7 +37,6 @@
 
 let
   cfg = config.services.fips;
-  stateDir = "/var/lib/fips";
 in
 {
   options.services.fips = {
@@ -57,8 +58,8 @@ in
       defaultText = lib.literalExpression "''${cfg.package}/share/fips/fips.yaml";
       description = ''
         Default fips.yaml used to seed the writable config at
-        /var/lib/fips/fips.yaml on first run. The operator can then edit
-        /var/lib/fips/fips.yaml directly; this file is never overwritten
+        /etc/fips/fips.yaml on first run. The operator can then edit
+        /etc/fips/fips.yaml directly; this file is never overwritten
         after the initial seed.
       '';
     };
@@ -98,18 +99,19 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # 'fips' group so non-root users can run fipsctl/fipstop without sudo
-    # and edit config/hosts files group-writable.
+    # 'fips' group so non-root users can reach the control socket for
+    # fipsctl/fipstop without sudo. Editing /etc/fips files requires root,
+    # matching the Debian/AUR posture.
     users.groups.fips = { };
 
-    # Writable directories for hosts file, ACL files, and nftables drop-ins.
-    # fips hardcodes /etc/fips/hosts, /etc/fips/peers.allow,
-    # /etc/fips/peers.deny on Linux, so these MUST live here. Created as
-    # real directories (not environment.etc symlinks) so the operator can
-    # edit files in place.
+    # Root-owned writable directories for hosts file, ACL files, and
+    # nftables drop-ins. fips hardcodes /etc/fips/hosts,
+    # /etc/fips/peers.allow, /etc/fips/peers.deny on Linux, so these MUST
+    # live here. Created as real directories (not environment.etc
+    # symlinks) so the operator can edit files in place as root.
     systemd.tmpfiles.rules = [
-      "d /etc/fips 0775 root fips -"
-      "d /etc/fips/fips.d 0775 root fips -"
+      "d /etc/fips 0755 root root -"
+      "d /etc/fips/fips.d 0755 root root -"
     ];
 
     systemd.services.fips = {
@@ -127,29 +129,33 @@ in
       preStart = ''
         # Seed writable config from the shipped default (only if absent).
         # fips derives key paths (fips.key/fips.pub) from the config file's
-        # parent directory, so keys also land in /var/lib/fips/.
-        if [ ! -f ${stateDir}/fips.yaml ]; then
-          cp "${cfg.configFile}" ${stateDir}/fips.yaml
-          chown root:fips ${stateDir}/fips.yaml
-          chmod 0664 ${stateDir}/fips.yaml
+        # parent directory, so keys also land in /etc/fips/.
+        # 0640 root:fips — group members (trusted operators) may read the
+        # config, the world may not: the yaml can carry an inline nsec.
+        if [ ! -f /etc/fips/fips.yaml ]; then
+          cp "${cfg.configFile}" /etc/fips/fips.yaml
+          chown root:fips /etc/fips/fips.yaml
+          chmod 0640 /etc/fips/fips.yaml
         fi
 
         # Seed hosts file (fips hardcodes /etc/fips/hosts on Linux).
+        # 0644 root:root — world-readable so fipsctl can load it without
+        # privileges; it holds only hostname → npub mappings.
         if [ ! -f /etc/fips/hosts ]; then
           cp "${cfg.package}/share/fips/hosts" /etc/fips/hosts
-          chown root:fips /etc/fips/hosts
-          chmod 0664 /etc/fips/hosts
+          chown root:root /etc/fips/hosts
+          chmod 0644 /etc/fips/hosts
         fi
       '';
 
       serviceConfig = {
         Type = "simple";
         # Run as root:fips so the daemon has root for TUN/raw sockets while
-        # group members can access the control socket and state files.
+        # group members can reach the control socket.
         Group = "fips";
         # --config bypasses the search path: fips loads ONLY this file,
-        # never /etc/fips/fips.yaml.
-        ExecStart = "${cfg.package}/bin/fips --config ${stateDir}/fips.yaml";
+        # never a stale or alternate config.
+        ExecStart = "${cfg.package}/bin/fips --config /etc/fips/fips.yaml";
         Restart = "on-failure";
         RestartSec = 5;
         # Back off between automatic restarts: 5s, 7s, 10s, 15s, 21s, then
@@ -159,14 +165,11 @@ in
         RestartSteps = 5;
         RestartMaxDelaySec = 30;
 
-        # Writable state directory (/var/lib/fips/) for config + keys.
-        # root:fips 0775 so group members can edit the config.
-        StateDirectory = "fips";
-        StateDirectoryMode = "0775";
-
-        # Control socket directory (/run/fips/) — group-accessible.
+        # Control socket directory (/run/fips/) — group-traversable so
+        # 'fips' group members can reach the socket (write permission is
+        # on the socket file itself). Matches upstream fips.service.
         RuntimeDirectory = "fips";
-        RuntimeDirectoryMode = "0770";
+        RuntimeDirectoryMode = "0750";
 
         # Log directory (/var/log/fips/) for the built-in profiler.
         LogsDirectory = "fips";
@@ -205,7 +208,7 @@ in
 
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/fips-gateway --config ${stateDir}/fips.yaml";
+        ExecStart = "${cfg.package}/bin/fips-gateway --config /etc/fips/fips.yaml";
         Restart = "on-failure";
         RestartSec = 5;
         # Back off between automatic restarts: 5s, 7s, 10s, 15s, 21s, then
