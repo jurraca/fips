@@ -144,11 +144,16 @@ in
     # matching the Debian/AUR posture.
     users.groups.fips = { };
 
+    # Put fipsctl/fipstop/fips-gateway on PATH so the operator can reach
+    # them without referencing the store path.
+    environment.systemPackages = [ cfg.package ];
+
     # .fips resolution presupposes systemd-resolved; surface a missing
     # resolver at eval time instead of only a failed fips-dns unit at boot.
     warnings = lib.optionals (cfg.dns.enable && !config.services.resolved.enable) [
       "services.fips.dns.enable is true but services.resolved.enable is false — .fips names will not resolve. Enable systemd-resolved, or forward the .fips zone to [::1]:5354 in your own resolver and ignore this warning."
     ];
+
     # Root-owned writable directories for hosts file, ACL files, and
     # nftables drop-ins. fips hardcodes /etc/fips/hosts,
     # /etc/fips/peers.allow, /etc/fips/peers.deny on Linux, so these MUST
