@@ -141,7 +141,14 @@
         fips = self.packages.${final.system}.default;
       };
 
-      # NixOS module — consumers import this and set services.fips.enable = true.
-      nixosModules.default = import ./packaging/nixos;
+      # NixOS module — consumers import this and set services.fips.enable
+      # = true. A thin wrapper around the raw module that injects the
+      # flake's own package as the option default, so consumers need
+      # neither the overlay nor an explicit services.fips.package.
+      # mkDefault keeps an explicit user setting authoritative.
+      nixosModules.default = { lib, pkgs, ... }: {
+        imports = [ ./packaging/nixos ];
+        services.fips.package = lib.mkDefault self.packages.${pkgs.system}.fips;
+      };
     };
 }

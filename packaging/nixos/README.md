@@ -38,12 +38,16 @@ Apply with:
 sudo nixos-rebuild switch --flake .#myhost
 ```
 
+The module defaults its package to the flake's own build — no overlay
+is needed. Apply `overlays.default` only if you want `pkgs.fips`
+available elsewhere in your package set.
+
 ## Options
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `services.fips.enable` | bool | `false` | Enable the FIPS mesh network daemon |
-| `services.fips.package` | package | `pkgs.fips` | The fips package (provided via overlay) |
+| `services.fips.package` | package | flake's own build | The fips package (set automatically by `nixosModules.default`) |
 | `services.fips.configFile` | path | shipped default | Default `fips.yaml` used to seed `/etc/fips/fips.yaml` on first run |
 | `services.fips.openFirewall` | bool | `true` | Open UDP 2121 + TCP 8443 |
 | `services.fips.firewall.enable` | bool | `false` | Load the `fips0` mesh-interface nftables baseline (`fips-firewall.service`) |
@@ -263,5 +267,7 @@ packaging/nixos/
 
 The flake also exposes:
 
-- `overlays.default` — adds `pkgs.fips`
-- `nixosModules.default` — the NixOS module
+- `overlays.default` — adds `pkgs.fips` (optional convenience; the
+  module does not need it)
+- `nixosModules.default` — the NixOS module, with its package default
+  wired to the flake's own build

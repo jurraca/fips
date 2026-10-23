@@ -44,11 +44,18 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.fips;
+      default = pkgs.fips or (throw ''
+        services.fips.package: pkgs.fips does not exist. Import this
+        module via the flake's nixosModules.default (which provides the
+        package), or apply the fips overlay (overlays.default), or set
+        services.fips.package explicitly.
+      '');
       defaultText = lib.literalExpression "pkgs.fips";
       description = ''
-        The fips package to use. Defaults to the one provided by the
-        fips flake overlay (overlays.default).
+        The fips package to use. The flake's nixosModules.default sets
+        this to its own build automatically; when importing the raw
+        module, apply the fips flake overlay (overlays.default) or set
+        this option explicitly.
       '';
     };
 
