@@ -43,6 +43,17 @@
 # DEFAULT_PEERS_DENY_PATH). They are runtime state — fipsctl peer
 # approvals write peers.allow — not declarative config, so they are
 # seeded once and then owned by the operator and the daemon.
+#
+# --- Identity ---
+#
+# The upstream default is ephemeral: a fresh keypair on every start,
+# which on NixOS churns the node's npub and mesh IPv6 on every rebuild
+# or crash-loop restart. Two opt-in knobs, both rendering
+# node.identity.persistent: true into the config:
+# services.fips.persistentIdentity makes the node mint one keypair on
+# first start and keep it in /etc/fips/fips.key;
+# services.fips.identityKeyFile provisions that key from a runtime
+# secret on every start, making the identity fully declarative.
 {
   config,
   lib,
@@ -58,8 +69,8 @@ let
   # listeners on the documented ports) plus the typed options.
   # cfg.settings is deep-merged over these, so users only override the
   # keys they care about. Identity is deliberately NOT defaulted here:
-  # upstream is ephemeral; a persistent identity is opted into via
-  # settings.node.identity.persistent.
+  # upstream is ephemeral; the persistentIdentity/identityKeyFile knobs
+  # opt in.
   defaultSettings =
     {
       tun = {
@@ -70,6 +81,9 @@ let
       dns.enabled = cfg.dns.enable;
       transports.udp.bind_addr = "0.0.0.0:2121";
       transports.tcp.bind_addr = "0.0.0.0:8443";
+    }
+    // lib.optionalAttrs (cfg.persistentIdentity || cfg.identityKeyFile != null) {
+      node.identity.persistent = true;
     }
     // lib.optionalAttrs cfg.gateway.enable {
       gateway.enabled = true;
@@ -154,18 +168,21 @@ in
       description = ''
         Escape hatch: an absolute path to a complete fips.yaml that the
         module symlinks to /etc/fips/fips.yaml verbatim. When set,
-        services.fips.settings and services.fips.peers are ignored —
-        the module cannot see inside your file, so everything the
-        daemon reads comes from it. Typed service-level options
-        (dns.enable, firewall.*, gateway.enable) still apply: they
-        drive module-side units, not the yaml. Use this to manage the
-        config outside Nix — e.g. a secrets-rendering tool that needs
-        an inline nsec, which settings must never carry because the
-        rendered yaml lands in the world-readable store. Pass a path
-        literal for a file you manage in your config tree (it is
-        copied into the store), or a plain string for runtime paths
-        like /run/secrets/...: a path literal must exist at eval time,
-        which a runtime-rendered secret does not.
+        services.fips.settings, services.fips.peers and
+        services.fips.persistentIdentity are ignored — the module
+        cannot see inside your file, so it must carry
+        node.identity.persistent: true itself for a persistent or
+        provisioned identity (verified at start when identityKeyFile is
+        set). Typed service-level options (dns.enable, firewall.*,
+        gateway.enable) still apply: they drive module-side units, not
+        the yaml. Use this to manage the config outside Nix — e.g. a
+        secrets-rendering tool that needs an inline nsec, which
+        settings must never carry because the rendered yaml lands in
+        the world-readable store. Pass a path literal for a file you
+        manage in your config tree (it is copied into the store), or a
+        plain string for runtime paths like /run/secrets/...: a path
+        literal must exist at eval time, which a runtime-rendered
+        secret does not.
       '';
     };
 
@@ -230,6 +247,48 @@ in
         explicit settings.tun.name wins); the nftables baseline, the
         gateway's interface wait and the daemon all read the final
         merged value, so a rename stays consistent everywhere.
+      '';
+    };
+
+    persistentIdentity = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Render node.identity.persistent: true into the config, so the
+        node mints one keypair on first start and keeps it
+        (fips.key/fips.pub in /etc/fips/) across restarts and rebuilds.
+        Fully declarative: removing the option reverts the node to the
+        upstream ephemeral default on the next start (a previously
+        generated fips.key stays on disk, unused). Default false
+        matches upstream. Ignored when configFile is set; an explicit
+        settings.node.identity.persistent always wins.
+      '';
+    };
+
+    identityKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Absolute runtime path (sops-nix, agenix, ...) to a file holding
+        the node's private key: a bare bech32 nsec with a trailing
+        newline, exactly as fipsctl keygen writes it. When set, the
+        module provisions /etc/fips/fips.key from this file on every
+        start (so secret rotation propagates) and renders
+        node.identity.persistent: true, making the node identity
+        declarative: a rebuild — or a full reinstall from this
+        configuration and the secret — reproduces the same identity.
+        The file must exist when the service starts; a missing file
+        fails the start loudly (Restart=on-failure retries until the
+        secret is mounted). Replacing an existing, different
+        /etc/fips/fips.key backs the old key up beside it and warns in
+        the journal. A string, not a path: an unquoted path literal
+        would be copied into the world-readable store, which is also
+        why this module does not offer an inline nsec option. With a
+        configFile, the file itself must carry
+        node.identity.persistent: true (checked at start); without one,
+        an explicit settings.node.identity.persistent = false trips an
+        eval-time warning, since the daemon would retire the
+        provisioned key to fips.key.unused and run ephemeral.
       '';
     };
 
@@ -331,6 +390,15 @@ in
       lib.optionals (cfg.dns.enable && !config.services.resolved.enable) [
         "services.fips.dns.enable is true but services.resolved.enable is false — .fips names will not resolve. Enable systemd-resolved, or forward the .fips zone to [::1]:5354 in your own resolver and ignore this warning."
       ]
+      # identityKeyFile must not point into the store: store paths are
+      # world-readable, the opposite of a secret.
+      ++ lib.optionals (cfg.identityKeyFile != null && lib.hasPrefix "/nix/store/" cfg.identityKeyFile) [
+        "services.fips.identityKeyFile points into the Nix store, which is world-readable; use a runtime secrets path (e.g. /run/secrets/...) instead."
+      ]
+      # A settings nsec would land in the world-readable store.
+      ++ lib.optionals ((cfg.settings.node.identity.nsec or null) != null) [
+        "services.fips.settings.node.identity.nsec is set: the rendered config lives in the world-readable Nix store, so the key would be readable by every local user. Provision /etc/fips/fips.key via services.fips.identityKeyFile instead."
+      ]
       # Property wrappers inside settings are silently ignored by the
       # recursiveUpdate merge and would render as garbage yaml.
       ++ lib.optionals (cfg.configFile == null && findPropWrappers cfg.settings != [ ]) [
@@ -344,8 +412,17 @@ in
       ++ lib.optionals (cfg.configFile != null && cfg.peers != [ ]) [
         "services.fips.configFile is set; services.fips.peers is ignored — declare the peers in the configFile itself."
       ]
+      ++ lib.optionals (cfg.configFile != null && cfg.persistentIdentity) [
+        "services.fips.configFile is set; services.fips.persistentIdentity is ignored — the configFile itself must carry node.identity.persistent: true for a persistent identity."
+      ]
       ++ lib.optionals (cfg.configFile != null && !lib.hasPrefix "/" (toString cfg.configFile)) [
         "services.fips.configFile must be an absolute path; a relative path cannot be resolved by the service unit."
+      ]
+      # identityKeyFile without persistence: the daemon would retire the
+      # provisioned key to fips.key.unused and run ephemeral. Only
+      # reachable by explicitly overriding the rendered default.
+      ++ lib.optionals (cfg.configFile == null && cfg.identityKeyFile != null && !(finalSettings.node.identity.persistent or false)) [
+        "services.fips.identityKeyFile provisions /etc/fips/fips.key, but the final settings have node.identity.persistent = false — the daemon would retire the key to fips.key.unused and run ephemeral. Keep services.fips.persistentIdentity (or set settings.node.identity.persistent = true), or drop identityKeyFile."
       ]
       # The daemon refuses to start a gateway without pool/lan_interface.
       ++ lib.optionals (cfg.configFile == null && cfg.gateway.enable && (finalSettings.gateway.pool or null) == null) [
@@ -399,6 +476,38 @@ in
           chown root:root /etc/fips/hosts
           chmod 0644 /etc/fips/hosts
         fi
+
+        ${lib.optionalString (cfg.identityKeyFile != null) ''
+          # Declarative identity: provision the key from the operator's
+          # secret store on every start, so rotation propagates. A missing
+          # source fails the start; Restart=on-failure retries until the
+          # secret is mounted.
+          if [ ! -f "${cfg.identityKeyFile}" ]; then
+            echo "services.fips.identityKeyFile: '${cfg.identityKeyFile}' does not exist (secrets not mounted?)" >&2
+            exit 1
+          fi
+          if [ -f /etc/fips/fips.key ] && ! ${pkgs.diffutils}/bin/cmp -s "${cfg.identityKeyFile}" /etc/fips/fips.key; then
+            # Never destroy identity material silently: keep the replaced
+            # key beside the config (the daemon looks up fips.key by exact
+            # name and ignores extra files) and say so loudly. Mirrors
+            # the daemon's own retire_key politeness.
+            cp -a /etc/fips/fips.key "/etc/fips/fips.key.replaced-$(date +%s)"
+            echo "WARNING: services.fips.identityKeyFile replaces the existing /etc/fips/fips.key; the old key was backed up beside it and this node's identity is changing." >&2
+          fi
+          install -m 0600 "${cfg.identityKeyFile}" /etc/fips/fips.key
+        ''}
+
+        ${lib.optionalString (cfg.identityKeyFile != null && cfg.configFile != null) ''
+          # With an operator-provided configFile the module cannot
+          # check at eval time whether it enables
+          # node.identity.persistent — without it the daemon retires
+          # the provisioned key to fips.key.unused and runs ephemeral.
+          # Verify and fail loudly instead.
+          grep -Eq '^[[:space:]]*persistent:[[:space:]]*true([[:space:]]*#.*)?$' /etc/fips/fips.yaml || {
+            echo "services.fips.identityKeyFile: the configFile at ${toString cfg.configFile} lacks node.identity.persistent: true (required so the daemon uses the provisioned key); edit it and restart" >&2
+            exit 1
+          }
+        ''}
       '';
 
       serviceConfig = {
